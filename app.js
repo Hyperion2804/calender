@@ -28,7 +28,9 @@ const $ = (id) => document.getElementById(id);   // getElementById only — not 
 
 const state = {
   user: null, profile: null,
-  people: [],            // active Admins + Superadmins: { email, name, role }
+  people: [],            // everyone on the calendar: active RMs, Team Leads, Admins, Superadmins
+  reports: new Set(),    // a Team Lead's direct reports (emails)
+  slots: [],             // busySlots: availability-only mirror of meetings and approved trips
   holidays: new Map(),   // "YYYY-MM-DD" -> name, managed in the Holidays view
   events: [],            // calEvents
   plans: [],             // Meeting Ledger weeklyPlans (meetings scheduled)
@@ -56,6 +58,16 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const onDomain = (email) => email.endsWith("@" + ORG_DOMAIN);
 const isSuperAdmin = () => state.profile?.role === "superadmin";
+const isAdminPlus = () => ["admin", "superadmin"].includes(state.profile?.role);
+const isTeamLead = () => state.profile?.role === "teamlead";
+// Who uses the calendar: everyone who logs meetings. Observer doesn't.
+const CAL_ROLES = ["rm", "teamlead", "admin", "superadmin"];
+const ROLE_LABEL = { rm: "RM", teamlead: "Team Lead", admin: "Admin", superadmin: "Superadmin" };
+// Full detail (client names, notes, logged meetings) for your own calendar,
+// your reports' if you're a Team Lead, and everyone's if you're an Admin.
+// Everyone else's calendar shows availability only.
+const seesDetail = (email) => email === me() || isAdminPlus() || (isTeamLead() && state.reports.has(email));
+const involves = (p, email) => p.rmEmail === email || (p.companionEmails || []).includes(email);
 const me = () => state.user.email;
 const nameOf = (email) => (state.people.find((p) => p.email === email) || {}).name || email;
 
@@ -124,13 +136,13 @@ onAuthStateChanged(auth, async (user) => {
   state.user = { email, uid: user.uid };
   let prof = null;
   try { const snap = await getDoc(doc(db, "users", email)); prof = snap.exists() ? snap.data() : null; } catch (e) { prof = null; }
-  if (!prof || prof.active !== true || !["admin", "superadmin"].includes(prof.role)) {
-    return deny("This calendar is for Admins and Superadmins.",
+  if (!prof || prof.active !== true || !CAL_ROLES.includes(prof.role)) {
+    return deny("This calendar is for the Hyperion team.",
       "Your account doesn't have access. If you think it should, ask a Superadmin to check your role in Meeting Ledger.");
   }
   state.profile = prof;
   $("who-name").textContent = prof.name || email;
-  $("who-role").textContent = prof.role === "superadmin" ? "Superadmin" : "Admin";
+  $("who-role").textContent = ROLE_LABEL[prof.role] || prof.role;
   showOnly("view-app");
   state.anchor = todayISO();
   state.person = email;
@@ -143,28 +155,95 @@ onAuthStateChanged(auth, async (user) => {
 });
 
 /* ============================ loading ============================ */
+const docsOf = (snap) => snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+// "field in [...]" is capped at 30 values per query, so larger lists are split.
+async function whereIn(col, field, values) {
+  const out = [];
+  for (let i = 0; i < values.length; i += 30) {
+    out.push(...docsOf(await getDocs(query(collection(db, col), where(field, "in", values.slice(i, i + 30))))));
+  }
+  return out;
+}
+const dedupe = (rows) => [...new Map(rows.map((r) => [r.id, r])).values()];
+
+// Admins read Meeting Ledger's collections whole, as before. Everyone else
+// reads only what Meeting Ledger already lets them see (their own, plus
+// their reports' for a Team Lead, plus meetings they're going along to),
+// and sees colleagues through busySlots, which carry no client details.
 async function loadAll() {
-  const [users, events, plans, travel] = await Promise.all([
-    getDocs(collection(db, "users")),
-    getDocs(collection(db, "calEvents")),
-    getDocs(collection(db, "weeklyPlans")),
-    getDocs(collection(db, "travelPlans"))
-  ]);
-  state.people = users.docs.map((d) => ({ email: d.id, ...d.data() }))
-    .filter((u) => u.active === true && ["admin", "superadmin"].includes(u.role))
+  const [users, events] = await Promise.all([getDocs(collection(db, "users")), getDocs(collection(db, "calEvents"))]);
+  const all = users.docs.map((d) => ({ ...d.data(), email: (d.data().email || d.id).toLowerCase() }));
+  state.reports = new Set(isTeamLead() ? all.filter((u) => u.managedBy === me()).map((u) => u.email) : []);
+  state.people = all
+    .filter((u) => u.active === true && CAL_ROLES.includes(u.role))
     .map((u) => ({ email: u.email, name: u.name || u.email, role: u.role }))
     .sort((a, b) => (a.email === me() ? -1 : b.email === me() ? 1 : a.name.localeCompare(b.name)));
-  state.events = events.docs.map((d) => ({ id: d.id, ...d.data() }));
-  state.plans = plans.docs.map((d) => ({ id: d.id, ...d.data() }));
-  state.travel = travel.docs.map((d) => ({ id: d.id, ...d.data() }));
+  state.events = docsOf(events);
+  try { state.slots = docsOf(await getDocs(collection(db, "busySlots"))); }
+  catch (e) { state.slots = []; console.warn("busySlots not readable yet — publish the latest firestore.rules:", e); }
+
+  if (isAdminPlus()) {
+    const [plans, travel] = await Promise.all([getDocs(collection(db, "weeklyPlans")), getDocs(collection(db, "travelPlans"))]);
+    state.plans = docsOf(plans);
+    state.travel = docsOf(travel);
+    await ensureWeek(state.anchor);
+    repairSlots();   // in the background; never holds up the calendar
+  } else {
+    const scope = [me(), ...state.reports];
+    const [plans, going, travel, meetings] = await Promise.all([
+      whereIn("weeklyPlans", "rmEmail", scope),
+      getDocs(query(collection(db, "weeklyPlans"), where("companionEmails", "array-contains", me()))).then(docsOf).catch(() => []),
+      whereIn("travelPlans", "rmEmail", scope),
+      whereIn("meetings", "rmEmail", scope)
+    ]);
+    state.plans = dedupe([...plans, ...going]);
+    state.travel = travel;
+    state.meetings = meetings;
+  }
   await loadHolidays();
   await loadTasks();
-  await ensureWeek(state.anchor);
   fillPersonSelect();
 }
 
-// Logged meetings can be many, so they're fetched a week at a time.
+// Admin-only: makes busySlots match the real plans and approved trips —
+// adds missing ones (e.g. plans made before slots existed), fixes changed
+// ones, removes ones whose plan or trip is gone. Quietly does nothing if
+// the rules aren't published yet.
+async function repairSlots() {
+  try {
+    const want = new Map();
+    for (const p of state.plans) want.set(`plan_${p.id}`, {
+      kind: "meeting", sourceId: p.id, ownerEmail: p.rmEmail, ownerName: p.rmName || p.rmEmail,
+      date: p.date || "", time: p.time || "", weekStart: p.weekStart || (p.date ? weekStartOf(p.date) : ""),
+      endDate: "", status: p.status || "Planned", companionEmails: p.companionEmails || []
+    });
+    for (const t of state.travel) if (t.status === "Approved") want.set(`travel_${t.id}`, {
+      kind: "travel", sourceId: t.id, ownerEmail: t.rmEmail, ownerName: t.rmName || t.rmEmail,
+      date: t.fromDate || "", time: "", weekStart: "", endDate: t.toDate || t.fromDate || "",
+      status: t.status, companionEmails: []
+    });
+    const have = new Map(state.slots.map((x) => [x.id, x]));
+    const same = (a, b) => ["kind", "ownerEmail", "date", "time", "weekStart", "endDate", "status"].every((k) => (a[k] || "") === (b[k] || ""))
+      && (a.companionEmails || []).join() === (b.companionEmails || []).join();
+    const ops = [];
+    for (const [id, w] of want) if (!have.has(id) || !same(have.get(id), w)) ops.push(["set", id, w]);
+    for (const id of have.keys()) if (!want.has(id)) ops.push(["del", id]);
+    if (!ops.length) return;
+    for (let i = 0; i < ops.length; i += 400) {
+      const batch = writeBatch(db);
+      ops.slice(i, i + 400).forEach(([op, id, w]) => op === "set"
+        ? batch.set(doc(db, "busySlots", id), { ...w, updatedAt: serverTimestamp() })
+        : batch.delete(doc(db, "busySlots", id)));
+      await batch.commit();
+    }
+    state.slots = docsOf(await getDocs(collection(db, "busySlots")));
+  } catch (e) { console.warn("Couldn't refresh availability slots:", e); }
+}
+
+// Admins: logged meetings can be many, so they're fetched a week at a time.
+// Everyone else already has their own (and reports') from loadAll.
 async function ensureWeek(iso) {
+  if (!isAdminPlus()) return;
   const start = weekStartOf(iso);
   if (state.loadedWeeks.has(start)) return;
   const end = addDaysISO(start, 6);
@@ -238,30 +317,38 @@ function itemsFor(email, iso) {
   const allDay = [], timed = [];
   const hol = state.holidays.get(iso);
   if (hol) allDay.push({ kind: "holiday", label: `Holiday: ${hol}`, src: "holiday", ref: { date: iso, name: hol } });
+  const detail = seesDetail(email);
   for (const e of state.events) {
     if (e.ownerEmail !== email || e.date > iso || e.endDate < iso) continue;
-    const label = e.title || EVENT_LABEL[e.kind] || "Busy";
-    if (e.allDay) allDay.push({ kind: e.kind, label: e.title ? `${EVENT_LABEL[e.kind]}: ${e.title}` : EVENT_LABEL[e.kind], src: "event", ref: e });
+    // Someone else's titles stay private unless you see their detail.
+    const title = detail ? e.title : "";
+    const label = title || EVENT_LABEL[e.kind] || "Busy";
+    if (e.allDay) allDay.push({ kind: e.kind, label: title ? `${EVENT_LABEL[e.kind]}: ${title}` : EVENT_LABEL[e.kind], src: "event", ref: e });
     else timed.push({ kind: e.kind, label, start: e.start, end: e.end, src: "event", ref: e });
   }
+  // Trips: the full trip where you can read it, otherwise just "Travelling".
+  const trips = new Map();
   for (const t of state.travel) {
-    if (t.rmEmail !== email || t.status !== "Approved") continue;
-    if ((t.fromDate || "") <= iso && (t.toDate || t.fromDate || "") >= iso) {
-      allDay.push({ kind: "travel", label: `Travelling: ${t.destination || ""}`, src: "travel", ref: t });
-    }
+    if (t.rmEmail === email && t.status === "Approved" && detail) trips.set(t.id, { label: `Travelling: ${t.destination || ""}`, src: "travel", ref: t, from: t.fromDate, to: t.toDate || t.fromDate });
   }
-  for (const p of state.plans) {
-    // Shows for the person who planned it and anyone going along.
-    if ((p.rmEmail !== email && !(p.companionEmails || []).includes(email)) || p.date !== iso || p.status === "Done") continue;
-    if (p.time && TIME_RE.test(p.time)) {
-      const s = toMin(p.time);
-      timed.push({ kind: "meet", label: `Meeting: ${p.name}`, start: p.time, end: fromMin(Math.min(s + 60, 24 * 60 - 1)), src: "plan", ref: p });
+  for (const x of state.slots) {
+    if (x.kind !== "travel" || x.ownerEmail !== email || x.status !== "Approved" || trips.has(x.sourceId)) continue;
+    trips.set(x.sourceId, { label: "Travelling", src: "slot", ref: x, from: x.date, to: x.endDate || x.date });
+  }
+  for (const t of trips.values()) {
+    if ((t.from || "") <= iso && (t.to || "") >= iso) allDay.push({ kind: "travel", label: t.label, src: t.src, ref: t.ref });
+  }
+  // Meetings scheduled — for the person who planned it and anyone going along.
+  for (const m of meetingsOn(email, (p) => p.date === iso)) {
+    if (m.time && TIME_RE.test(m.time)) {
+      const s = toMin(m.time);
+      timed.push({ kind: "meet", label: m.label, start: m.time, end: fromMin(Math.min(s + 60, 24 * 60 - 1)), src: m.src, ref: m.ref });
     } else {
-      allDay.push({ kind: "meet", label: `Meeting: ${p.name}`, src: "plan", ref: p });
+      allDay.push({ kind: "meet", label: m.label, src: m.src, ref: m.ref });
     }
   }
   for (const m of state.meetings) {
-    if (m.rmEmail !== email || m.date !== iso) continue;
+    if (!detail || m.rmEmail !== email || m.date !== iso) continue;
     allDay.push({ kind: "logged", label: `Met: ${m.prospectName || ""}`, src: "meeting", ref: m });
   }
   const order = { holiday: -1, leave: 0, ooo: 1, wfh: 2, travel: 3, busy: 4, meet: 5, logged: 6 };
@@ -269,9 +356,28 @@ function itemsFor(email, iso) {
   timed.sort((a, b) => a.start.localeCompare(b.start));
   return { allDay, timed, onLeave: allDay.some((x) => x.kind === "leave"), dayOff: !officeDay(iso).working };
 }
+// A person's meetings scheduled (not Done) matching `when`. Uses the real
+// plan where this viewer can read it and should see it (their own, a
+// report's, an Admin's view, or one they're going along to); otherwise the
+// busySlot, shown only as "Meeting".
+function meetingsOn(email, when) {
+  const out = new Map();
+  for (const p of state.plans) {
+    if (!involves(p, email) || p.status === "Done" || !when(p)) continue;
+    if (!seesDetail(email) && !involves(p, me())) continue;
+    out.set(p.id, { label: `Meeting: ${p.name}`, time: p.time, src: "plan", ref: p });
+  }
+  for (const x of state.slots) {
+    if (x.kind !== "meeting" || out.has(x.sourceId) || x.status === "Done") continue;
+    if (x.ownerEmail !== email && !(x.companionEmails || []).includes(email)) continue;
+    if (!when(x)) continue;
+    out.set(x.sourceId, { label: "Meeting", time: x.time, src: "slot", ref: x });
+  }
+  return [...out.values()];
+}
 // Meetings scheduled for the week with the day still TBC.
 function tbcFor(email, weekStart) {
-  return state.plans.filter((p) => (p.rmEmail === email || (p.companionEmails || []).includes(email)) && !p.date && p.weekStart === weekStart && p.status !== "Done");
+  return meetingsOn(email, (p) => !p.date && p.weekStart === weekStart);
 }
 
 /* ============================ rendering ============================ */
@@ -346,8 +452,8 @@ function renderGrid(host, days) {
   }
   // day-TBC strip
   if (tbc.length) {
-    html += `<div class="tbc-strip"><b>This week, day not confirmed:</b> ${tbc.map((p) =>
-      `<button class="btn-link" data-plan="${p.id}">${esc(p.name)}</button>`).join(" · ")}</div>`;
+    html += `<div class="tbc-strip"><b>This week, day not confirmed:</b> ${tbc.map((m) =>
+      `<button class="btn-link" ${refAttr(m)}>${esc(m.src === "plan" ? m.ref.name : "Meeting")}</button>`).join(" · ")}</div>`;
   }
   // all-day row
   html += `<div class="allday label">All day</div>`;
@@ -400,6 +506,7 @@ function refAttr(it) {
   if (it.src === "plan") return `data-plan="${it.ref.id}"`;
   if (it.src === "travel") return `data-travel="${it.ref.id}"`;
   if (it.src === "holiday") return `data-holiday="${it.ref.date}"`;
+  if (it.src === "slot") return `data-slot="${it.ref.id}"`;
   return `data-meeting="${it.ref.id}"`;
 }
 function chip(it) {
@@ -419,6 +526,7 @@ function wireItems(host) {
     const iso = b.dataset.holiday;
     showDetail("holiday", { date: iso, name: state.holidays.get(iso) });
   }));
+  host.querySelectorAll("[data-slot]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); showDetail("slot", state.slots.find((x) => x.id === b.dataset.slot)); }));
   host.querySelectorAll("[data-meeting]").forEach((b) => b.addEventListener("click", (e) => { e.stopPropagation(); showDetail("meeting", state.meetings.find((x) => x.id === b.dataset.meeting)); }));
 }
 
@@ -428,7 +536,7 @@ function renderTeam(days) {
     `<th class="${iso === today ? "today" : ""}">${esc(fmtDay(iso))}</th>`).join("")}</tr></thead><tbody>`;
   for (const p of state.people) {
     html += `<tr><td><button class="btn-link team-person" data-person="${esc(p.email)}">${esc(p.email === me() ? `${p.name} (you)` : p.name)}</button>
-      <div class="team-role">${p.role === "superadmin" ? "Superadmin" : "Admin"}</div></td>`;
+      <div class="team-role">${esc(ROLE_LABEL[p.role] || p.role)}</div></td>`;
     for (const iso of days) {
       const h = officeHoursOn(iso);
       const off = officeDay(iso);
@@ -456,10 +564,19 @@ function showDetail(kind, r) {
   if (!r) return;
   let title = "", rows = [];
   if (kind === "event") {
-    title = r.title || EVENT_LABEL[r.kind];
+    const detail = seesDetail(r.ownerEmail);
+    title = (detail && r.title) || EVENT_LABEL[r.kind];
     rows = [["Whose", nameOf(r.ownerEmail)], ["Type", EVENT_LABEL[r.kind]],
-      ["When", r.allDay ? (r.date === r.endDate ? fmtDMY(r.date) : `${fmtDMY(r.date)} to ${fmtDMY(r.endDate)}`) : `${fmtDMY(r.date)}, ${r.start}–${r.end}`],
-      ["Notes", r.notes || "—"]];
+      ["When", r.allDay ? (r.date === r.endDate ? fmtDMY(r.date) : `${fmtDMY(r.date)} to ${fmtDMY(r.endDate)}`) : `${fmtDMY(r.date)}, ${r.start}–${r.end}`]];
+    if (detail) rows.push(["Notes", r.notes || "—"]);
+  } else if (kind === "slot") {
+    const trip = r.kind === "travel";
+    title = trip ? "Travelling" : "Meeting";
+    rows = [["Whose", r.ownerName || nameOf(r.ownerEmail)],
+      ["When", trip ? `${fmtDMY(r.date)} to ${fmtDMY(r.endDate || r.date)}`
+        : r.date ? `${fmtDMY(r.date)}${r.time ? ", " + r.time : ""}` : `Week of ${fmtDMY(r.weekStart)}, day not confirmed`]];
+    if (!trip && (r.companionEmails || []).length) rows.push(["Going with", r.companionEmails.map(nameOf).join(", ")]);
+    rows.push(["Details", "Visible only to them, their Team Lead and Admins"]);
   } else if (kind === "holiday") {
     title = `Holiday: ${r.name}`;
     rows = [["Date", fmtDMY(r.date)], ["Who", "Everyone, office closed"], ["From", "Holidays (firm-wide)"]];
