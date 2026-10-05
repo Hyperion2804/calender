@@ -251,7 +251,8 @@ function itemsFor(email, iso) {
     }
   }
   for (const p of state.plans) {
-    if (p.rmEmail !== email || p.date !== iso || p.status === "Done") continue;
+    // Shows for the person who planned it and anyone going along.
+    if ((p.rmEmail !== email && !(p.companionEmails || []).includes(email)) || p.date !== iso || p.status === "Done") continue;
     if (p.time && TIME_RE.test(p.time)) {
       const s = toMin(p.time);
       timed.push({ kind: "meet", label: `Meeting: ${p.name}`, start: p.time, end: fromMin(Math.min(s + 60, 24 * 60 - 1)), src: "plan", ref: p });
@@ -270,7 +271,7 @@ function itemsFor(email, iso) {
 }
 // Meetings scheduled for the week with the day still TBC.
 function tbcFor(email, weekStart) {
-  return state.plans.filter((p) => p.rmEmail === email && !p.date && p.weekStart === weekStart && p.status !== "Done");
+  return state.plans.filter((p) => (p.rmEmail === email || (p.companionEmails || []).includes(email)) && !p.date && p.weekStart === weekStart && p.status !== "Done");
 }
 
 /* ============================ rendering ============================ */
@@ -464,7 +465,7 @@ function showDetail(kind, r) {
     rows = [["Date", fmtDMY(r.date)], ["Who", "Everyone, office closed"], ["From", "Holidays (firm-wide)"]];
   } else if (kind === "plan") {
     title = `Meeting: ${r.name}`;
-    rows = [["Whose", r.rmName || r.rmEmail], ["When", r.date ? `${fmtDMY(r.date)}${r.time ? ", " + r.time : ""}` : `Week of ${fmtDMY(r.weekStart)}, day not confirmed`],
+    rows = [["Whose", r.rmName || r.rmEmail], ["Going with", (r.companionNames || []).join(", ") || "Alone"], ["When", r.date ? `${fmtDMY(r.date)}${r.time ? ", " + r.time : ""}` : `Week of ${fmtDMY(r.weekStart)}, day not confirmed`],
       ["Person type", r.personType || "—"], ["Location", r.location || "—"], ["Purpose", r.purpose || "—"], ["Status", r.status || "—"],
       ["From", "Meeting Ledger → Meetings scheduled"]];
   } else if (kind === "travel") {
