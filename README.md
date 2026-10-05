@@ -1,21 +1,51 @@
 # Hyperion Calendar
 
-Office timings, availability and plans for Hyperion's **Admins and
-Superadmins**. A separate app from Meeting Ledger, but it uses the **same
-Firebase project** on purpose: the same accounts sign in, and it can show
-Meeting Ledger's scheduled meetings, logged meetings and approved travel
-without copying any data.
+Office timings, availability and plans for the **whole Hyperion team**. A
+separate app from Meeting Ledger, but it uses the **same Firebase project**
+on purpose: the same accounts sign in, and it can show Meeting Ledger's
+scheduled meetings, logged meetings and approved travel without copying
+any client data.
 
 Vanilla JS, no build step. Hosted on GitHub Pages. Files: `index.html`,
 `app.js`, `styles.css`, `config.js`, `README.md`.
 
 ## Who can use it
 
-Only active **Admins and Superadmins** (their role is set in Meeting
-Ledger's Team tab). Anyone else who signs in sees a "this calendar is for
-Admins and Superadmins" screen, and the security rules refuse them the
-data anyway. Accounts, passwords and roles are all managed in Meeting
+Every active **RM, Team Lead, Admin and Superadmin** (roles are set in
+Meeting Ledger's Team tab). Observers see a "this calendar is for the
+Hyperion team" screen. Accounts and passwords are managed in Meeting
 Ledger; there's no sign-up here.
+
+Everyone sees everyone's calendar (Week, Day and Team views), but how
+much depends on whose it is:
+
+| Viewer | Own calendar | A colleague's |
+|---|---|---|
+| RM | Full detail | Availability only |
+| Team Lead | Full detail | Full for their direct reports, availability only for others |
+| Admin / Superadmin | Full detail | Full detail for everyone |
+
+**Availability only** means: Busy / Out of office / WFH / Leave without
+the title or notes, "Travelling" without the destination, and scheduled
+meetings as just "Meeting" at that time, no client name, phone, location
+or purpose. A meeting you're going along to shows in full. Logged
+meetings ("Met: …") only show where you see full detail.
+
+How that's kept private: colleagues' meetings and trips come from
+`busySlots`, a small mirror Meeting Ledger writes holding only who, when
+and status. The real `weeklyPlans`, `travelPlans` and `meetings` stay
+readable only by the owner, their Team Lead and Admins, exactly as in
+Meeting Ledger. Whenever an Admin or Superadmin opens the calendar, it
+quietly fills in any missing slots (including every meeting planned
+before this existed) and fixes stale ones, so have an Admin open it once
+after deploying.
+
+One thing to know: the title and notes on someone's own Busy/Leave/OOO/
+WFH entries are hidden on screen from colleagues, but the database lets
+the team read them. Keep those entries to work-safe wording.
+
+Day tasks stay private to each Superadmin; only a Superadmin adds or
+removes holidays.
 
 ## What's on it
 
