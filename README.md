@@ -40,6 +40,7 @@ Ledger; there's no sign-up here.
     block; without one they're an all-day item; day-TBC ones appear in a
     "This week, day not confirmed" strip. Plans already marked Done are
     left out (the logged meeting shows instead).
+    A meeting planned with colleagues ("Going with" in Meeting Ledger) shows on each of their calendars too, and its detail lists who's going.
   - *Logged meetings* — as "Met: name" on that day.
   - *Approved travel plans* — as "Travelling: place" across those days.
     Pending or rejected trips don't show.
